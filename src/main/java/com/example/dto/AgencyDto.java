@@ -1,8 +1,6 @@
 package com.example.dto;
 
-import java.io.Serializable;
-
-public class AgencyDto implements Serializable {
+public class AgencyDto {
 
     private Long id;
     private String agencyCode;

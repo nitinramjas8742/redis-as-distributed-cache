@@ -1,23 +1,21 @@
 package com.example.repository;
 
-import com.example.dto.AgencyDto;
 import com.example.entity.Agency;
 import com.example.service.AgencyCacheService;
 import io.quarkus.hibernate.orm.panache.PanacheRepository;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
+import jakarta.persistence.EntityManager;
 import org.jboss.logging.Logger;
 
-import java.util.*;
-import java.util.stream.Collectors;
+import java.util.Collections;
+import java.util.List;
+import java.util.Objects;
 
 /**
- * AgencyQueryRepository (Read / Query Model)
- *
- * Implements transparent Distributed L2 Caching:
- * - Read operations query Redis (Distributed L2 Cache) first.
- * - Cache misses fall back to PostgreSQL and populate Redis L2 with configured TTL.
- * - Supports single and batch lookup (Redis MGET + batch DB lookup + Redis MSET).
+ * Reads: local Hibernate L2 + shared Redis version marker.
+ * Redis holds ONLY version per agencyCode. Equal = trust L2 (0 SQL),
+ * else JPA-evict + clear L1 + DB reload + re-warm both.
  */
 @ApplicationScoped
 public class AgencyQueryRepository implements PanacheRepository<Agency> {
@@ -25,43 +23,68 @@ public class AgencyQueryRepository implements PanacheRepository<Agency> {
     private static final Logger LOG = Logger.getLogger(AgencyQueryRepository.class);
 
     @Inject
-    AgencyCacheService l2Cache;
+    EntityManager em;
 
-    /**
-     * Finds single agency by agencyCode using Distributed L2 Cache.
-     * 1. Check Redis L2
-     * 2. On miss, query PostgreSQL and populate Redis L2
-     */
+    @Inject
+    AgencyCacheService versionCache;
+
     public Agency findByAgencyCode(String agencyCode) {
         if (agencyCode == null || agencyCode.isBlank()) {
             return null;
         }
 
-        // 1. Check Redis L2 Cache
-        AgencyDto cached = l2Cache.get(agencyCode);
-        if (cached != null) {
-            LOG.debugf("[L2 Cache HIT] Serving from Redis for agencyCode: %s", agencyCode);
-            return Agency.fromDto(cached);
+        Long redisVer = versionCache.getVersion(agencyCode);
+
+        Agency result = em.unwrap(org.hibernate.Session.class)
+                .byNaturalId(Agency.class)
+                .using("agencyCode", agencyCode)
+                .load();
+
+        if (result == null) {
+            if (redisVer != null) {
+                versionCache.evictVersion(agencyCode);
+            }
+            return null;
         }
 
-        // 2. L2 Cache Miss -> Query PostgreSQL
-        LOG.debugf("[L2 Cache MISS] Querying DB for agencyCode: %s", agencyCode);
-        Agency entity = find("agencyCode", agencyCode).firstResult();
-
-        // 3. Populate Redis L2 Cache
-        if (entity != null) {
-            l2Cache.put(entity);
+        if (redisVer == null) {
+            em.getEntityManagerFactory().getCache().evict(Agency.class, result.getId());
+            em.clear();
+            Agency fresh = em.unwrap(org.hibernate.Session.class)
+                    .byNaturalId(Agency.class)
+                    .using("agencyCode", agencyCode)
+                    .load();
+            if (fresh != null) {
+                result = fresh;
+                versionCache.putVersion(agencyCode, fresh.getVersion());
+                LOG.infof("[L2 MISS] No marker for %s, DB refresh v=%s", agencyCode, fresh.getVersion());
+            }
+        } else if (coerce(result.getVersion()) != coerce(redisVer)) {
+            Long staleVer = result.getVersion();
+            Object staleId = result.getId();
+            em.getEntityManagerFactory().getCache().evict(Agency.class, staleId);
+            em.clear();
+            Agency fresh = em.unwrap(org.hibernate.Session.class)
+                    .byNaturalId(Agency.class)
+                    .using("agencyCode", agencyCode)
+                    .load();
+            if (fresh != null) {
+                result = fresh;
+                versionCache.putVersion(agencyCode, fresh.getVersion());
+                LOG.infof("[L2 STALE] Local v=%s vs Redis v=%s for %s, DB refresh v=%s",
+                        staleVer, redisVer, agencyCode, fresh.getVersion());
+            }
+        } else {
+            LOG.debugf("[L2 HIT] %s v=%s", agencyCode, result.getVersion());
         }
 
-        return entity;
+        return result;
     }
 
-    /**
-     * Batch finds agencies by list of agencyCodes using Distributed L2 Cache:
-     * 1. Redis batch MGET
-     * 2. DB lookup only for missing keys
-     * 3. Redis batch MSET for missing keys with TTL
-     */
+    private static long coerce(Long v) {
+        return v == null ? 0L : v;
+    }
+
     public List<Agency> findByAgencyCodes(List<String> agencyCodes) {
         if (agencyCodes == null || agencyCodes.isEmpty()) {
             return Collections.emptyList();
@@ -76,43 +99,9 @@ public class AgencyQueryRepository implements PanacheRepository<Agency> {
             return Collections.emptyList();
         }
 
-        Map<String, Agency> foundMap = new HashMap<>();
-        List<String> missingCodes = new ArrayList<>();
-
-        // Step 1: Query Redis L2 Cache via MGET
-        Map<String, AgencyDto> cachedMap = l2Cache.mget(distinctCodes);
-        for (String code : distinctCodes) {
-            String key = l2Cache.buildKey(code);
-            AgencyDto dto = cachedMap.get(key);
-            if (dto != null) {
-                foundMap.put(code, Agency.fromDto(dto));
-            } else {
-                missingCodes.add(code);
-            }
-        }
-
-        LOG.debugf("[L2 Batch Cache] Found %d in L2, %d missing in L2", foundMap.size(), missingCodes.size());
-
-        // Step 2: Query DB only for L2 misses
-        if (!missingCodes.isEmpty()) {
-            List<Agency> dbEntities = list("agencyCode in ?1", missingCodes);
-            Map<String, AgencyDto> toCache = new HashMap<>();
-
-            for (Agency entity : dbEntities) {
-                foundMap.put(entity.getAgencyCode(), entity);
-                toCache.put(l2Cache.buildKey(entity.getAgencyCode()), l2Cache.toDto(entity));
-            }
-
-            // Step 3: Populate L2 cache for missing entries via MSET
-            if (!toCache.isEmpty()) {
-                l2Cache.mput(toCache);
-            }
-        }
-
-        // Return ordered result list matching input list
-        return agencyCodes.stream()
-                .map(foundMap::get)
+        return distinctCodes.stream()
+                .map(this::findByAgencyCode)
                 .filter(Objects::nonNull)
-                .collect(Collectors.toList());
+                .toList();
     }
 }

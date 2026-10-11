@@ -1,18 +1,17 @@
-# Quarkus Agency Distributed Cache (Redis + Panache ORM)
+# Quarkus Agency Distributed Cache (Hibernate L2 + Redis Version Markers)
 
-A production-grade reference architecture for a multi-pod Quarkus application on OpenShift, implementing **Solution 1 (JPA Lifecycle Listeners + Transactional Post-Commit Eviction with Redis)**.
+Near (local Caffeine L2) + far (shared Redis `@Version` markers) coherence for a multi-pod Quarkus app. Writes go straight to DB (bypass cache), then double-delete the Redis marker so other pods force DB refresh on next GET.
 
 ---
 
 ## 🎯 Architecture Summary
 
 * **Framework:** Quarkus 3.15 + Gradle
-* **ORM:** Hibernate ORM with Panache
-* **Cache Provider:** Redis via `quarkus-redis-client` (`RedisDataSource`)
-* **Environment:** Multi-pod deployment on OpenShift (No cache drift between pods)
-* **Creation Optimization:** `@PostPersist` is ignored; **zero wasted Redis eviction calls on INSERTs**.
-* **Update Consistency:** `@PostUpdate` fires CDI event; cache is evicted **after DB commit succeeds** (`TransactionPhase.AFTER_SUCCESS`).
-* **Batch Optimization:** `findByAgencyCodes` executes Redis `MGET`, fetches only cache misses from DB via `IN (:missingCodes)`, and updates Redis via `MSET`.
+* **ORM:** Hibernate ORM with Panache + L2 (Caffeine, per-pod) + `@NaturalId agencyCode`
+* **Coherence:** Redis holds ONLY `agency:ver:CODE → @Version` (8 bytes, not DTOs) via `AgencyCacheService`
+* **Reads:** `AgencyQueryRepository.byNaturalId` compares local version vs Redis marker; equal = L2 HIT (0 SQL), else JPA-evict + `em.clear()` + DB reload + re-warm both
+* **Writes:** `AgencyRepository` DB-direct (bypass cache); `PUT/DELETE` double-delete marker (pre + post-commit via `TransactionSynchronizationRegistry`); `POST` warms marker post-commit
+* **Fail-open:** Redis errors degrade to DB reads, never 500s
 
 ---
 
@@ -31,17 +30,12 @@ quarkus-agency-cache/
 │   │   │   │   ├── AgencyDto.java                  # Redis-serializable DTO
 │   │   │   │   └── BulkQueryRequest.java           # Bulk lookup request payload
 │   │   │   ├── entity/
-│   │   │   │   └── Agency.java                     # Entity with @EntityListeners
-│   │   │   ├── event/
-│   │   │   │   └── AgencyEvictionEvent.java        # Eviction event record
-│   │   │   ├── listener/
-│   │   │   │   ├── AgencyEntityListener.java       # JPA @PostUpdate & @PostRemove listener
-│   │   │   │   └── AgencyCacheInvalidationListener.java # CDI @Observes(AFTER_SUCCESS)
+│   │   │   │   └── Agency.java                     # @Cacheable READ_WRITE + @NaturalId + @Version (entity-only)
 │   │   │   ├── repository/
-│   │   │   │   ├── AgencyQueryRepository.java      # Query model with transparent Redis L2 Cache & batch MGET
-│   │   │   │   └── AgencyRepository.java           # Command model for transactional DB persistence
+│   │   │   │   ├── AgencyQueryRepository.java      # Reads: L2 + Redis version validation, evict+reload heal
+│   │   │   │   └── AgencyRepository.java           # Writes: DB-direct (bypass cache for strong consistency)
 │   │   │   ├── service/
-│   │   │   │   └── AgencyCacheService.java         # Dedicated Redis L2 cache provider & fail-open delegate
+│   │   │   │   └── AgencyCacheService.java         # Redis version markers get/put/evict (fail-open)
 │   │   │   └── resource/
 │   │   │       └── AgencyResource.java             # REST API separating queries and commands
 │   │   └── resources/
@@ -71,12 +65,12 @@ gradle quarkusDev
 gradle test
 ```
 
-The test suite in [`AgencyCacheResourceTest.java`](src/test/java/com/example/AgencyCacheResourceTest.java) tests and proves:
-1. **Creation:** Calling `saveOrUpdate` for a new agency persists to DB and makes **0 calls to Redis eviction**.
-2. **Read:** Single GET fetches from DB and populates `agency:code:AGY001` in Redis.
-3. **Update:** Calling `saveOrUpdate` on an existing entity triggers `@PostUpdate`, waits for DB commit, and **evicts the key from Redis**.
-4. **Batch Read:** Bulk query checks Redis via `MGET`, fetches only missing agencies from DB, and populates Redis via `MSET`.
-5. **Delete:** Deletion evicts the key from Redis post-commit.
+The test suite in [`AgencyCacheResourceTest.java`](src/test/java/com/example/AgencyCacheResourceTest.java) is STALE (asserts old `agency:code:` DTO keys) and needs rewrite to `agency:ver:` Long markers. Current behavior to assert:
+1. **Creation:** `POST` persists to DB, warms `agency:ver:CODE` post-commit.
+2. **Read:** 1st `GET` = `COHERENCE MISS` + DB refresh + warm marker; 2nd `GET` = L2 `HIT` (0 SQL).
+3. **Update:** `PUT` double-deletes marker; next `GET` on any pod = `STALE → refresh v+1`, then `HIT`.
+4. **Batch Read:** per-code coherence check via `findByAgencyCodes`.
+5. **Delete:** double-deletes marker; next `GET` = 404 + marker cleaned.
 
 ---
 
@@ -89,24 +83,93 @@ curl -X POST http://localhost:8080/api/agencies \
   -d '{"agencyCode": "AGY001", "name": "Delta Travel", "email": "info@delta.com", "status": "ACTIVE"}'
 ```
 
-### 2. Query Agency (Caches in Redis)
+### 2. Query Agency (near+far coherence)
 ```bash
 curl http://localhost:8080/api/agencies/AGY001
 ```
+1st = `COHERENCE MISS` + DB refresh, 2nd = L2 `HIT`.
 
-### 3. Update Agency (Evicts from Redis post-commit)
+### 3. Update Agency (double-deletes version marker)
 ```bash
 curl -X PUT http://localhost:8080/api/agencies/AGY001 \
   -H "Content-Type: application/json" \
   -d '{"name": "Delta Global Travel", "email": "info@delta.com", "status": "ACTIVE"}'
 ```
 
-### 4. Bulk Query (Redis MGET + missing DB fetch + MSET)
+### 4. Bulk Query (per-code coherence check)
 ```bash
 curl -X POST http://localhost:8080/api/agencies/bulk \
   -H "Content-Type: application/json" \
   -d '{"agencyCodes": ["AGY001", "AGY002", "AGY003"]}'
 ```
+
+---
+
+## 🔀 Flow Diagrams (multi-pod coherence)
+
+### Components
+```mermaid
+flowchart TB
+  subgraph PodA["Pod-A"]
+    L2A["Caffeine L2<br/>id→entity<br/>code→id"]
+  end
+  subgraph PodB["Pod-B"]
+    L2B["Caffeine L2<br/>id→entity<br/>code→id"]
+  end
+  REDIS[("Redis shared<br/>agency:ver:CODE → v")]
+  DB[("Postgres shared<br/>agency + version")]
+
+  L2A <--> REDIS
+  L2B <--> REDIS
+  REDIS <--> DB
+```
+
+### Read path (GET /:code)
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant R as GET /:code (any pod)
+  participant L2 as Local L2
+  participant RS as Redis ver
+  participant D as Postgres
+  C->>R: GET AGY001
+  R->>RS: GET agency:ver:AGY001
+  R->>L2: byNaturalId.load()
+  alt ver equal → HIT
+    R-->>C: 200 entity (0 SQL)
+  else ver null/mismatch → STALE
+    R->>L2: JPA evict(id) + em.clear()
+    R->>D: byNaturalId.load() NORMAL
+    D-->>R: fresh v8
+    R->>L2: re-put v8
+    R->>RS: SET ver v8
+    R-->>C: 200 fresh
+  end
+```
+
+### Write path (PUT /:code)
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant W as PUT /:code (writer pod)
+  participant D as Postgres
+  participant RS as Redis ver
+  participant O as Other pods (later GET)
+  C->>W: PUT AGY001 {...}
+  W->>D: SELECT + UPDATE (v7→v8)
+  W->>RS: DEL agency:ver:AGY001 (pre)
+  W->>D: COMMIT
+  W->>RS: DEL agency:ver:AGY001 (post-commit via TSR)
+  Note over O: Next GET: ver MISS → evict L1/L2 → DB REFRESH v8 → SET ver v8
+```
+
+**30-sec narration:**
+1. Reads are near+far: local Caffeine L2 is fast, Redis holds only `version` per code as shared truth.
+2. Every `GET` compares `local.version` vs `Redis.version`. Equal = serve L2, zero SQL. Else evict-by-id, clear L1, reload DB once, re-warm both.
+3. Writes go straight to DB (bypass cache), then double-delete the Redis marker (inside Tx + post-commit). No data in Redis, 8 bytes per key.
+4. Other pods heal lazily on next `GET` — one `STALE → refresh` log, then `HIT`. Fail-open: Redis down = every `GET` refreshes DB (slower, still correct).
+
+> Multi-pod dev note: disable Dev Services and point both instances at ONE Postgres + ONE Redis, else each `quarkusDev` spawns isolated containers and updates stay invisible.
 
 ---
 

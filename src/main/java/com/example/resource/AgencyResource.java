@@ -5,7 +5,11 @@ import com.example.dto.BulkQueryRequest;
 import com.example.entity.Agency;
 import com.example.repository.AgencyQueryRepository;
 import com.example.repository.AgencyRepository;
+import com.example.service.AgencyCacheService;
 import jakarta.inject.Inject;
+import jakarta.transaction.Synchronization;
+import jakarta.transaction.Status;
+import jakarta.transaction.TransactionSynchronizationRegistry;
 import jakarta.transaction.Transactional;
 import jakarta.ws.rs.*;
 import jakarta.ws.rs.core.MediaType;
@@ -32,8 +36,39 @@ public class AgencyResource {
     @Inject
     AgencyRepository agencyRepository;
 
+    @Inject
+    AgencyCacheService versionCache;
+
+    @Inject
+    TransactionSynchronizationRegistry tsr;
+
     /**
-     * 1. GET Single Agency: Query path served via Distributed L2 Cache (Redis -> DB fallback)
+     * Runs eviction only after DB commit succeeds. If no Tx, runs immediately.
+     * Pre-evict (inside Tx) + post-commit evict = double-delete, closes the
+     * race where a reader re-caches stale data between DEL and commit.
+     */
+    private void evictVersionAfterCommit(String agencyCode) {
+        try {
+            tsr.registerInterposedSynchronization(new Synchronization() {
+                @Override
+                public void beforeCompletion() {
+                }
+
+                @Override
+                public void afterCompletion(int status) {
+                    if (status == Status.STATUS_COMMITTED) {
+                        versionCache.evictVersion(agencyCode);
+                    }
+                }
+            });
+        } catch (Exception e) {
+            LOG.warnf("TSR not available for %s, evicting inline: %s", agencyCode, e.getMessage());
+            versionCache.evictVersion(agencyCode);
+        }
+    }
+
+    /**
+     * 1. GET Single Agency: near (local L2) + far (Redis version marker) coherence.
      */
     @GET
     @Path("/{code}")
@@ -48,7 +83,7 @@ public class AgencyResource {
     }
 
     /**
-     * 2. POST Bulk Query: Query path served via Distributed L2 Cache (Redis MGET + DB missing lookup)
+     * 2. POST Bulk Query: same coherence check per code via query repository.
      */
     @POST
     @Path("/bulk")
@@ -61,9 +96,7 @@ public class AgencyResource {
     }
 
     /**
-     * 3. POST Create Agency: Command path persisting to DB via AgencyRepository.
-     * Newly created entities trigger @PostPersist, NOT @PostUpdate.
-     * Result: ZERO wasted Redis eviction calls!
+     * 3. POST Create Agency: persists to DB, warms Redis version marker post-commit.
      */
     @POST
     @Transactional
@@ -81,6 +114,26 @@ public class AgencyResource {
 
         Agency agency = new Agency(dto.getAgencyCode(), dto.getName(), dto.getEmail(), dto.getStatus());
         agencyRepository.saveOrUpdate(agency);
+        // Warm far marker post-commit so first GET is coherent (no extra REFRESH).
+        try {
+            agencyRepository.getEntityManager().flush();
+            Long v = agency.getVersion();
+            String code = agency.getAgencyCode();
+            tsr.registerInterposedSynchronization(new Synchronization() {
+                @Override
+                public void beforeCompletion() {
+                }
+
+                @Override
+                public void afterCompletion(int status) {
+                    if (status == Status.STATUS_COMMITTED) {
+                        versionCache.putVersion(code, v);
+                    }
+                }
+            });
+        } catch (Exception e) {
+            LOG.warnf("Create warm failed, first GET will DB-load: %s", e.getMessage());
+        }
 
         LOG.infof("Agency created: %s. (No cache eviction event fired)", agency.getAgencyCode());
         return Response.created(URI.create("/api/agencies/" + agency.getAgencyCode()))
@@ -89,9 +142,8 @@ public class AgencyResource {
     }
 
     /**
-     * 4. PUT Update Agency: Command path updating DB via AgencyRepository.
-     * Modifying managed entity triggers @PostUpdate in Hibernate!
-     * Result: Invalidation event fired and processed post-commit!
+     * 4. PUT Update Agency: updates DB, double-deletes Redis version marker
+     * (pre + post-commit) so other pods force DB REFRESH on next GET.
      */
     @PUT
     @Path("/{code}")
@@ -110,13 +162,17 @@ public class AgencyResource {
 
         agency = agencyRepository.saveOrUpdate(agency);
 
+        // Double-delete: pre-evict now + post-commit evict. Next GET on any pod
+        // sees Redis MISS -> forces DB REFRESH -> re-warms with new version.
+        versionCache.evictVersion(code);
+        evictVersionAfterCommit(code);
+
         LOG.infof("Agency updated: %s. (Eviction event will trigger post-commit)", code);
         return Response.ok(agency).build();
     }
 
     /**
-     * 5. DELETE Agency: Command path deleting entity via AgencyRepository.
-     * Triggers @PostRemove -> Eviction event fired and processed post-commit!
+     * 5. DELETE Agency: removes from DB, double-deletes Redis version marker.
      */
     @DELETE
     @Path("/{code}")
@@ -128,6 +184,9 @@ public class AgencyResource {
         }
 
         agencyRepository.delete(agency);
+        // Delete must also invalidate far marker on all pods.
+        versionCache.evictVersion(code);
+        evictVersionAfterCommit(code);
         LOG.infof("Agency deleted: %s. (Eviction event will trigger post-commit)", code);
         return Response.noContent().build();
     }

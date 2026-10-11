@@ -1,7 +1,5 @@
 package com.example.service;
 
-import com.example.dto.AgencyDto;
-import com.example.entity.Agency;
 import io.quarkus.redis.datasource.RedisDataSource;
 import io.quarkus.redis.datasource.keys.KeyCommands;
 import io.quarkus.redis.datasource.value.ValueCommands;
@@ -11,18 +9,16 @@ import jakarta.inject.Inject;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 
-import java.util.*;
-
 /**
- * Distributed L2 Cache Provider backed by Redis.
- * Responsible for Redis serialization, TTL management, batch MGET/MSET,
- * and fail-open error handling for Agency entities.
+ * Cross-pod coherence markers backed by Redis.
+ * Stores ONLY DB @Version per agencyCode (agency:ver:CODE), not full data.
+ * Fail-open everywhere: Redis errors degrade to DB reads, never 500s.
  */
 @ApplicationScoped
 public class AgencyCacheService {
 
     private static final Logger LOG = Logger.getLogger(AgencyCacheService.class);
-    private static final String KEY_PREFIX = "agency:code:";
+    private static final String VER_PREFIX = "agency:ver:";
 
     @Inject
     RedisDataSource redisDataSource;
@@ -30,122 +26,58 @@ public class AgencyCacheService {
     @ConfigProperty(name = "app.cache.agency.ttl-seconds", defaultValue = "3600")
     long ttlSeconds;
 
-    private ValueCommands<String, AgencyDto> valueCommands;
+    private ValueCommands<String, Long> versionCommands;
     private KeyCommands<String> keyCommands;
 
     @PostConstruct
     void init() {
-        this.valueCommands = redisDataSource.value(AgencyDto.class);
+        this.versionCommands = redisDataSource.value(Long.class);
         this.keyCommands = redisDataSource.key();
     }
 
-    public String buildKey(String agencyCode) {
-        return KEY_PREFIX + agencyCode;
+    private String buildVersionKey(String agencyCode) {
+        return VER_PREFIX + agencyCode;
     }
 
     /**
-     * Reads a single entity DTO from Redis L2 cache.
-     * Returns null on cache miss or when Redis fails (fail-open).
+     * Version marker for cross-pod coherence. Stores DB @Version per agencyCode.
+     * Small payload (8 bytes) instead of full DTO. Fail-open: null on miss/error.
      */
-    public AgencyDto get(String agencyCode) {
+    public Long getVersion(String agencyCode) {
         if (agencyCode == null || agencyCode.isBlank()) {
             return null;
         }
-        String key = buildKey(agencyCode);
         try {
-            AgencyDto cached = valueCommands.get(key);
-            if (cached != null) {
-                LOG.debugf("[L2 Cache HIT] Found in Redis for key: %s", key);
-                return cached;
-            }
-            LOG.debugf("[L2 Cache MISS] Key not in Redis: %s", key);
+            return versionCommands.get(buildVersionKey(agencyCode));
         } catch (Exception e) {
-            LOG.warnf("[L2 Cache Warning] Redis GET failed for key %s, falling open. Error: %s", key, e.getMessage());
+            LOG.warnf("[VER Warning] Redis GETVER failed for %s: %s", agencyCode, e.getMessage());
+            return null;
         }
-        return null;
     }
 
-    /**
-     * Alias for get(agencyCode) for backwards compatibility.
-     */
-    public AgencyDto findByAgencyCode(String agencyCode) {
-        return get(agencyCode);
-    }
-
-    /**
-     * Writes an entity to Redis L2 cache with configured TTL.
-     */
-    public void put(Agency entity) {
-        if (entity == null || entity.getAgencyCode() == null) {
+    public void putVersion(String agencyCode, Long version) {
+        if (agencyCode == null) {
             return;
         }
-        String key = buildKey(entity.getAgencyCode());
-        AgencyDto dto = toDto(entity);
+        // Coerce NULL (pre-backfill rows) -> 0 so Redis always warms.
+        // Without this every GET sees MISS and forces DB REFRESH in a loop.
+        long v = (version == null) ? 0L : version;
         try {
-            valueCommands.setex(key, ttlSeconds, dto);
-            LOG.debugf("[L2 Cache WRITE] Stored key in Redis: %s with TTL: %d seconds", key, ttlSeconds);
+            versionCommands.setex(buildVersionKey(agencyCode), ttlSeconds, v);
         } catch (Exception e) {
-            LOG.warnf("[L2 Cache Warning] Failed to write key %s to Redis: %s", key, e.getMessage());
+            LOG.warnf("[VER Warning] Redis PUTVER failed for %s: %s", agencyCode, e.getMessage());
         }
     }
 
-    /**
-     * Batch reads multiple keys from Redis L2 cache via MGET.
-     */
-    public Map<String, AgencyDto> mget(List<String> agencyCodes) {
-        if (agencyCodes == null || agencyCodes.isEmpty()) {
-            return Collections.emptyMap();
-        }
-        List<String> keys = agencyCodes.stream().map(this::buildKey).toList();
-        try {
-            Map<String, AgencyDto> results = valueCommands.mget(keys.toArray(new String[0]));
-            return results != null ? results : Collections.emptyMap();
-        } catch (Exception e) {
-            LOG.warnf("[L2 Cache Warning] Redis MGET failed: %s", e.getMessage());
-            return Collections.emptyMap();
-        }
-    }
-
-    /**
-     * Batch writes multiple entities to Redis L2 cache via MSET and sets TTL.
-     */
-    public void mput(Map<String, AgencyDto> toCache) {
-        if (toCache == null || toCache.isEmpty()) {
+    public void evictVersion(String agencyCode) {
+        if (agencyCode == null) {
             return;
         }
         try {
-            valueCommands.mset(toCache);
-            for (String key : toCache.keySet()) {
-                keyCommands.expire(key, ttlSeconds);
-            }
-            LOG.debugf("[L2 Cache WRITE] Saved %d items to Redis", toCache.size());
+            keyCommands.del(buildVersionKey(agencyCode));
+            LOG.infof("[VER EVICT] Evicted version key for agencyCode: %s", agencyCode);
         } catch (Exception e) {
-            LOG.warnf("[L2 Cache Warning] Redis MSET failed: %s", e.getMessage());
+            LOG.warnf("[VER Warning] Redis DELVER failed for %s: %s", agencyCode, e.getMessage());
         }
-    }
-
-    /**
-     * Evicts a key from Redis L2 cache.
-     */
-    public void evict(String agencyCode) {
-        if (agencyCode == null) return;
-        String key = buildKey(agencyCode);
-        try {
-            keyCommands.del(key);
-            LOG.infof("[L2 Cache EVICT] Successfully evicted key from Redis: %s", key);
-        } catch (Exception e) {
-            LOG.errorf("[L2 Cache Error] Failed to evict key %s from Redis: %s", key, e.getMessage());
-        }
-    }
-
-    public AgencyDto toDto(Agency entity) {
-        if (entity == null) return null;
-        return new AgencyDto(
-                entity.getId(),
-                entity.getAgencyCode(),
-                entity.getName(),
-                entity.getEmail(),
-                entity.getStatus()
-        );
     }
 }

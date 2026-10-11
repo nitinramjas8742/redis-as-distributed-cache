@@ -4,16 +4,12 @@ import com.example.entity.Agency;
 import io.quarkus.hibernate.orm.panache.PanacheRepository;
 import jakarta.enterprise.context.ApplicationScoped;
 
-import java.util.Collections;
-import java.util.List;
-
 /**
  * AgencyRepository (Command / Write Model)
  *
  * Dedicated strictly to persistence operations (PostgreSQL / Hibernate ORM).
- * Contains zero caching logic.
- * Mutations trigger @PostUpdate and @PostRemove JPA entity listeners for
- * post-commit L2 cache invalidation.
+ * Write-path reads bypass L2 on purpose (strong consistency for mutations).
+ * Cross-pod coherence is handled via Redis version markers, see AgencyCacheService.
  */
 @ApplicationScoped
 public class AgencyRepository implements PanacheRepository<Agency> {
@@ -25,16 +21,6 @@ public class AgencyRepository implements PanacheRepository<Agency> {
     public Agency findByAgencyCode(String agencyCode) {
         if (agencyCode == null) return null;
         return find("agencyCode", agencyCode).firstResult();
-    }
-
-    /**
-     * Direct database batch lookup by agencyCodes.
-     */
-    public List<Agency> findByAgencyCodes(List<String> agencyCodes) {
-        if (agencyCodes == null || agencyCodes.isEmpty()) {
-            return Collections.emptyList();
-        }
-        return list("agencyCode in ?1", agencyCodes);
     }
 
     /**
